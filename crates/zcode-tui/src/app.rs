@@ -595,14 +595,20 @@ impl App {
     }
 
     fn append_streaming(&mut self, delta: &str, kind: MsgKind) {
+        // guard anti-duplicado: los frames v4 re-entregan contenido por
+        // initial/online/recovery en CUALQUIER orden (el thinking puede llegar
+        // de nuevo después del texto); un bloque grande ya presente en otro
+        // mensaje del mismo tipo es re-entrega, no texto nuevo
+        if delta.chars().count() >= 24
+            && self
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.kind == kind && m.content.contains(delta))
+        {
+            return;
+        }
         if let Some(last) = self.messages.last_mut() {
             if last.role == Role::Assistant && last.kind == kind {
-                // guard anti-duplicado: los frames v4 re-entregan texto por
-                // initial/online/recovery; un bloque grande ya contenido en el
-                // mensaje actual es re-entrega, no texto nuevo
-                if delta.chars().count() >= 24 && last.content.contains(delta) {
-                    return;
-                }
                 last.content.push_str(delta);
                 return;
             }
