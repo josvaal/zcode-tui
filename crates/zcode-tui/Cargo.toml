@@ -1,0 +1,19 @@
+[package]
+name = "zcode-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zcode-client = { path = "../zcode-client" }
+zcode-launcher = { path = "../zcode-launcher" }
+tokio = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+syntect = { workspace = true }
+serde_json = { workspace = true }
+anyhow = "1"
+
+[[bin]]
+name = "zcode-tui"
+path = "src/main.rs"
