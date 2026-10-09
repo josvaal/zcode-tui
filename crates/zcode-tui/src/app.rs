@@ -33,13 +33,14 @@ pub struct Command {
     pub hint: &'static str,
 }
 
-pub const COMMANDS: [Command; 9] = [
+pub const COMMANDS: [Command; 10] = [
     Command { name: "modelo", hint: "elegir plan/modelo/nivel (ctrl+p)" },
     Command { name: "modo", hint: "build/edit/plan/yolo (ctrl+o)" },
     Command { name: "sesiones", hint: "listar y reanudar (ctrl+s)" },
     Command { name: "tema", hint: "ciclar tema (ctrl+t)" },
     Command { name: "tools", hint: "expandir/colapsar tools y diffs (o)" },
     Command { name: "archivos", hint: "buscar archivo del workspace (@)" },
+    Command { name: "fork", hint: "bifurcar la sesión con su historial" },
     Command { name: "compact", hint: "compactar el contexto de la sesión" },
     Command { name: "limpiar", hint: "vaciar el transcript" },
     Command { name: "salir", hint: "cerrar la TUI" },
@@ -365,6 +366,18 @@ impl App {
                 }
             }
             "modo" => self.picker = Some(Picker::Mode(0)),
+            "fork" => {
+                if self.streaming {
+                    self.push(
+                        Role::System,
+                        MsgKind::Text,
+                        "no puedes bifurcar con un turno corriendo — esc lo detiene primero",
+                    );
+                } else {
+                    self.connector.fork_session();
+                    self.push(Role::System, MsgKind::Text, "bifurcando la sesión…");
+                }
+            }
             "compact" => {
                 self.connector.compact();
                 self.push(Role::System, MsgKind::Text, "compactando el contexto de la sesión…");
@@ -598,6 +611,20 @@ impl App {
                             } else {
                                 self.connector.request_usage();
                             }
+                        }
+                        Some(AgentEvent::Forked { from: _, to }) => {
+                            // cambiar a la copia: transcript limpio, historial nuevo
+                            self.messages.clear();
+                            self.tool_msg_index.clear();
+                            self.anim_buffer.clear();
+                            self.scroll = 0;
+                            self.auto_scroll = true;
+                            self.current_session = Some(to.clone());
+                            self.push(
+                                Role::System,
+                                MsgKind::Text,
+                                format!("sesión bifurcada → {} (la original quedó intacta)", &to[..to.len().min(8)]),
+                            );
                         }
                         Some(AgentEvent::Usage(u)) => {
                             self.usage_text = Some(u);

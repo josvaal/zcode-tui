@@ -11,7 +11,7 @@ Lo tachado ya está implementado.
 - [x] Copiar respuesta — `c` con OSC52
 - [ ] Steer (enviar YA interrumpiendo) — v4 `sendText` con `requestedDelivery: startNow`
 - [ ] Editar in-place el turno (rewind del chat y archivos) — v4 `editUserQuery` + `applyFileRewind` (requieren CAS `baseRevision`/`baseLogEpoch`)
-- [ ] Fork de conversación desde un turno — v4 `forkAssistant`
+- [x] Fork de sesión — `/fork` → `session/fork` (latestCheckpoint, fallback por índice de turno)
 
 ## Sesión y contexto
 - [x] Modo build/edit/plan/yolo — `Ctrl+O` → `session/setMode`

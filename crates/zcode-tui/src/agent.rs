@@ -54,6 +54,8 @@ pub enum AgentEvent {
     SessionsList(Vec<SessionInfo>),
     /// La sesión quedó creada/reanudada con este id.
     SessionReady(String),
+    /// La sesión se bifurcó: (id original, id de la copia).
+    Forked { from: String, to: String },
     /// Prompt del usuario del historial (resume).
     HistoryUser(String),
     /// El servidor pide aprobación de permiso. (token, resumen, opciones)
@@ -110,6 +112,9 @@ enum SessionCmd {
     Usage,
     /// Reanudar una sesión previa.
     ResumeSession { session_id: String },
+    /// Bifurcar la sesión actual: copia con todo el historial hasta el último
+    /// checkpoint, dejando la sesión original intacta.
+    ForkSession,
     /// Cambiar el modelo de la sesión en caliente.
     SetModel {
         provider_id: String,
@@ -135,6 +140,14 @@ impl Connector {
     pub fn resume_session(&self, session_id: String) {
         if let Connector::Stdio { cmd_tx } = self {
             let _ = cmd_tx.send(SessionCmd::ResumeSession { session_id });
+        }
+    }
+
+    /// Bifurca la sesión actual: crea una copia nueva con el historial
+    /// completo y cambia a ella; la original queda intacta.
+    pub fn fork_session(&self) {
+        if let Connector::Stdio { cmd_tx } = self {
+            let _ = cmd_tx.send(SessionCmd::ForkSession);
         }
     }
 
@@ -261,7 +274,7 @@ pub async fn connect_stdio(
             "options": { "reasoningLevel": level.clone().unwrap_or_else(|| "max".into()) },
         })
     });
-    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
 
     // 1. session/create
@@ -292,6 +305,9 @@ pub async fn connect_stdio(
     let err_tx = agent_tx.clone();
     let connection_id = format!("zcode-tui-{}", std::process::id());
     let mut pending_resume: Option<(u64, String)> = None;
+    let mut pending_fork: Option<u64> = None;
+    // turnos enviados en esta sesión (para el fallback de fork por índice)
+    let mut turn_count: usize = 0;
     let workspace_for_list = workspace.clone();
     // solo aceptamos fin de turno después de ver la fase running del turno actual
     let mut saw_running = false;
@@ -333,6 +349,23 @@ pub async fn connect_stdio(
                                 .await;
                             pending_resume = Some((next_id, target));
                             next_id += 1;
+                        }
+                        Some(SessionCmd::ForkSession) => {
+                            // el server rechaza el fork con un prompt corriendo
+                            if let Some(sid) = &session_id {
+                                let _ = agent
+                                    .send(
+                                        next_id,
+                                        "session/fork",
+                                        &json!({
+                                            "sessionId": sid,
+                                            "target": { "kind": "latestCheckpoint" },
+                                        }),
+                                    )
+                                    .await;
+                                pending_fork = Some(next_id);
+                                next_id += 1;
+                            }
                         }
                         Some(SessionCmd::PermissionAnswer { token, allow, always }) => {
                             if let Some((raw_id, _options, tool_name)) =
@@ -440,6 +473,7 @@ pub async fn connect_stdio(
                             }
                         }
                         Some(SessionCmd::SendPrompt(content)) => {
+                            turn_count += 1;
                             if let Some(sid) = &session_id {
                                 let mut params = json!({
                                     "sessionId": sid,
@@ -593,6 +627,86 @@ pub async fn connect_stdio(
                                         .collect();
                                     list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                                     let _ = agent_tx.send(AgentEvent::SessionsList(list));
+                                }
+                            }
+                            // respuesta de session/fork → cambiar a la copia y re-suscribir
+                            if let Some(rid) = pending_fork {
+                                if rid == id {
+                                    pending_fork = None;
+                                    match &result {
+                                        Ok(r) => {
+                                            let newsid = r
+                                                .get("forkedSessionId")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string())
+                                                .or_else(|| find_string(r, "forkedSessionId"));
+                                            if let Some(newsid) = newsid {
+                                                let old =
+                                                    session_id.clone().unwrap_or_default();
+                                                session_id = Some(newsid.clone());
+                                                let _ = agent_tx.send(AgentEvent::Forked {
+                                                    from: old,
+                                                    to: newsid.clone(),
+                                                });
+                                                let _ = agent
+                                                    .send(
+                                                        next_id,
+                                                        "v4/conversation/subscribe",
+                                                        &json!({
+                                                            "topic": format!("conversation/{newsid}"),
+                                                            "connectionId": connection_id,
+                                                            "clientMode": "web-remote-replayable",
+                                                            "visibility": "foreground",
+                                                        }),
+                                                    )
+                                                    .await;
+                                                next_id += 1;
+                                                let _ = agent
+                                                    .send(
+                                                        next_id,
+                                                        "session/subscribe",
+                                                        &json!({ "sessionId": newsid, "deliveryKind": "desktop-continuous" }),
+                                                    )
+                                                    .await;
+                                                next_id += 1;
+                                                // resetear contadores de dedupe: historial nuevo
+                                                projector = FrameProjector::default();
+                                            } else {
+                                                let _ = agent_tx.send(AgentEvent::Error(
+                                                    format!("session/fork sin forkedSessionId: {r}"),
+                                                ));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let msg = e.to_string();
+                                            // sin checkpoint (sesión solo-texto): el
+                                            // server acepta fork por índice de turno
+                                            if msg.contains("checkpoint") && turn_count > 0 {
+                                                if let Some(sid) = session_id.clone() {
+                                                    let _ = agent
+                                                        .send(
+                                                            next_id,
+                                                            "session/fork",
+                                                            &json!({
+                                                                "sessionId": sid,
+                                                                "target": {
+                                                                    "kind": "turn",
+                                                                    "turnIndex": turn_count - 1,
+                                                                },
+                                                            }),
+                                                        )
+                                                        .await;
+                                                    pending_fork = Some(next_id);
+                                                    next_id += 1;
+                                                    continue;
+                                                }
+                                            }
+                                            let _ = agent_tx.send(AgentEvent::Error(
+                                                format!("session/fork: {msg}"),
+                                            ));
+                                        }
+                                    }
+                                    continue;
                                 }
                             }
                             // respuesta de session/resume → re-suscribir a la sesión reanudada
