@@ -34,6 +34,15 @@ pub struct Message {
     pub role: Role,
     pub kind: MsgKind,
     pub content: String,
+    /// Tool/Diff: mostrar cuerpo completo o solo la línea compacta `▸ …`
+    pub expanded: bool,
+}
+
+/// Cursor del input multilinea (posición en chars dentro de cada línea).
+#[derive(Default, Clone, Copy)]
+pub struct InputCursor {
+    pub col: usize,
+    pub row: usize,
 }
 
 pub struct App {
@@ -41,11 +50,15 @@ pub struct App {
     pub streaming_since: Option<std::time::Instant>,
     pub hint_shown: bool,
     pub messages: Vec<Message>,
-    pub input: String,
+    /// input multilinea: una String por línea
+    pub input: Vec<String>,
+    pub input_cursor: InputCursor,
     pub scroll: u16,
     pub auto_scroll: bool,
     pub focus_input: bool,
     pub streaming: bool,
+    /// tick para el spinner del status bar (avanza con el redibujo de 50ms)
+    pub tick: usize,
     pub connector: Connector,
     pub user_label: String,
     pub should_quit: bool,
@@ -72,19 +85,17 @@ pub struct App {
 impl App {
     pub fn new(connector: Connector) -> App {
         App {
-            theme: crate::theme::DARK,
+            theme: crate::theme::load(),
             streaming_since: None,
             hint_shown: false,
-            messages: vec![Message {
-                role: Role::System,
-                kind: MsgKind::Text,
-                content: "zcode-tui listo — escribe un prompt y presiona Enter".into(),
-            }],
-            input: String::new(),
+            messages: Vec::new(), // transcript vacío → pantalla de bienvenida
+            input: vec![String::new()],
+            input_cursor: InputCursor::default(),
             scroll: 0,
             auto_scroll: true,
             focus_input: true,
             streaming: false,
+            tick: 0,
             connector,
             user_label: "tú".into(),
             should_quit: false,
@@ -153,7 +164,77 @@ impl App {
             role,
             kind,
             content: content.into(),
+            expanded: true,
         });
+    }
+
+    /// Colapsa todos los tool calls y diffs: al cerrar el turno solo quedan
+    /// sus líneas compactas `▸ …`, como en opencode.
+    fn collapse_tools(&mut self) {
+        for m in &mut self.messages {
+            if matches!(m.role, Role::Tool | Role::Diff) {
+                m.expanded = false;
+            }
+        }
+    }
+
+    /// `o`: si hay algo colapsado lo expande todo; si no, colapsa todo.
+    fn toggle_tools(&mut self) {
+        let any_collapsed = self
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, Role::Tool | Role::Diff) && !m.expanded);
+        for m in &mut self.messages {
+            if matches!(m.role, Role::Tool | Role::Diff) {
+                m.expanded = any_collapsed;
+            }
+        }
+    }
+
+    /// Texto del prompt listo para enviar (líneas unidas).
+    fn input_text(&self) -> String {
+        self.input.join("\n")
+    }
+
+    fn clear_input(&mut self) {
+        self.input = vec![String::new()];
+        self.input_cursor = InputCursor::default();
+    }
+
+    /// Inserta texto (tecla o paste) respetando \n y el cursor.
+    fn insert_input(&mut self, text: &str) {
+        for (i, part) in text.split('\n').enumerate() {
+            if i > 0 {
+                self.split_line_at_cursor();
+            }
+            let row = self.input_cursor.row;
+            let col = self.input_cursor.col;
+            if let Some(line) = self.input.get_mut(row) {
+                let byte = Self::char_to_byte(line, col);
+                line.insert_str(byte, part);
+                self.input_cursor.col += part.chars().count();
+            }
+        }
+    }
+
+    fn split_line_at_cursor(&mut self) {
+        let row = self.input_cursor.row;
+        let col = self.input_cursor.col;
+        let rest = {
+            let line = &mut self.input[row];
+            let byte = Self::char_to_byte(line, col);
+            line.split_off(byte)
+        };
+        self.input.insert(row + 1, rest);
+        self.input_cursor.row += 1;
+        self.input_cursor.col = 0;
+    }
+
+    fn char_to_byte(s: &str, char_idx: usize) -> usize {
+        s.char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(s.len())
     }
 
     /// `extra_rx`: stream de frames del agente real (modo zcode); se bombea al
@@ -194,12 +275,27 @@ impl App {
         let mut terminal = ratatui::init();
         // sin captura de mouse por defecto: la selección/copiar del terminal
         // funciona siempre; `m` activa la rueda del scroll cuando se quiera
+        // bracketed paste: pegar código multi-línea no lo envía
+        {
+            use crossterm::execute;
+            let _ = execute!(
+                terminal.backend_mut(),
+                crossterm::event::EnableBracketedPaste
+            );
+        }
         let res = self.event_loop(&mut terminal, &mut rx, &mut key_rx).await;
         if self.mouse_capture {
             use crossterm::execute;
             let _ = execute!(
                 terminal.backend_mut(),
                 crossterm::event::DisableMouseCapture
+            );
+        }
+        {
+            use crossterm::execute;
+            let _ = execute!(
+                terminal.backend_mut(),
+                crossterm::event::DisableBracketedPaste
             );
         }
         ratatui::restore();
@@ -215,11 +311,12 @@ impl App {
         loop {
             terminal.draw(|f| ui::draw(f, self))?;
 
+            self.tick = self.tick.wrapping_add(1);
             self.drain_anim_buffer();
             self.maybe_streaming_hint();
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                    continue; // redibujo periódico (typewriter + cronómetro)
+                    continue; // redibujo periódico (typewriter + spinner + cronómetro)
                 }
                 maybe_ev = rx.recv() => {
                     match maybe_ev {
@@ -282,6 +379,7 @@ impl App {
                         Some(AgentEvent::Done) => {
                             self.streaming = false;
                             self.streaming_since = None;
+                            self.collapse_tools();
                         }
                         Some(AgentEvent::Error(e)) => {
                             self.push(Role::System, MsgKind::Text, format!("error: {e}"));
@@ -306,6 +404,11 @@ impl App {
                 maybe_key = key_rx.recv() => {
                     match maybe_key {
                         Some(crossterm::event::Event::Mouse(m)) => self.handle_mouse(m),
+                        Some(crossterm::event::Event::Paste(text)) => {
+                            if self.focus_input {
+                                self.insert_input(&text);
+                            }
+                        }
                         Some(ev) => self.handle_key(ev),
                         None => {}
                     }
@@ -339,8 +442,10 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         // Ctrl+S: abrir/cerrar la sidebar de sesiones
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        if ctrl && key.code == KeyCode::Char('s') {
             self.sidebar = if self.sidebar.is_some() {
                 None
             } else if !self.sessions.is_empty() {
@@ -348,6 +453,13 @@ impl App {
             } else {
                 None
             };
+            return;
+        }
+        // Ctrl+T: ciclar tema
+        if ctrl && key.code == KeyCode::Char('t') {
+            self.theme = crate::theme::next(self.theme);
+            crate::theme::save(self.theme);
+            self.push(Role::System, MsgKind::Text, format!("tema → {}", self.theme.name));
             return;
         }
         // navegación de la sidebar
@@ -390,9 +502,7 @@ impl App {
             }
         }
         // Ctrl+P: abrir/cerrar el picker de modelos
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.code == KeyCode::Char('p')
-        {
+        if ctrl && key.code == KeyCode::Char('p') {
             self.picker = if self.picker.is_some() {
                 None
             } else if !self.models.is_empty() {
@@ -471,6 +581,11 @@ impl App {
                 }
             }
         }
+        // o expande/colapsa los tool calls y diffs (fuera del input)
+        if key.code == KeyCode::Char('o') && !self.focus_input {
+            self.toggle_tools();
+            return;
+        }
         // m alterna la rueda del mouse (y con ella, la selección de texto)
         if key.code == KeyCode::Char('m') && !self.focus_input {
             self.mouse_capture = !self.mouse_capture;
@@ -518,19 +633,89 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('c') if ctrl => {
                 self.should_quit = true;
             }
             _ if !self.focus_input => self.handle_scroll_key(key.code),
+            // Alt+Enter: nueva línea en el prompt
+            KeyCode::Enter if alt => self.split_line_at_cursor(),
             KeyCode::Enter => self.submit(),
-            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Char(c) if !ctrl && !alt => self.insert_input(&c.to_string()),
             KeyCode::Backspace => {
-                self.input.pop();
+                let row = self.input_cursor.row;
+                let col = self.input_cursor.col;
+                if col > 0 {
+                    if let Some(line) = self.input.get_mut(row) {
+                        let byte = Self::char_to_byte(line, col);
+                        // quitar 1 char antes del cursor
+                        let prev = line[..byte]
+                            .char_indices()
+                            .next_back()
+                            .map(|(b, _)| b)
+                            .unwrap_or(0);
+                        line.replace_range(prev..byte, "");
+                        self.input_cursor.col -= 1;
+                    }
+                } else if row > 0 {
+                    // unir con la línea anterior
+                    let prev_len = self.input[row - 1].chars().count();
+                    let cur = self.input.remove(row);
+                    self.input[row - 1].push_str(&cur);
+                    self.input_cursor.row -= 1;
+                    self.input_cursor.col = prev_len;
+                }
             }
-            KeyCode::Esc => self.input.clear(),
+            KeyCode::Left => {
+                self.input_cursor.col = self.input_cursor.col.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                let row_len = self
+                    .input
+                    .get(self.input_cursor.row)
+                    .map(|l| l.chars().count())
+                    .unwrap_or(0);
+                if self.input_cursor.col < row_len {
+                    self.input_cursor.col += 1;
+                }
+            }
+            KeyCode::Up => {
+                if self.input_cursor.row > 0 {
+                    self.input_cursor.row -= 1;
+                    self.clamp_cursor_col();
+                } else {
+                    self.auto_scroll = false;
+                    self.scroll = self.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if self.input_cursor.row + 1 < self.input.len() {
+                    self.input_cursor.row += 1;
+                    self.clamp_cursor_col();
+                } else {
+                    self.scroll = self.scroll.saturating_add(1);
+                }
+            }
+            KeyCode::Home => self.input_cursor.col = 0,
+            KeyCode::End => {
+                self.input_cursor.col = self
+                    .input
+                    .get(self.input_cursor.row)
+                    .map(|l| l.chars().count())
+                    .unwrap_or(0);
+            }
+            KeyCode::Esc => self.clear_input(),
             KeyCode::Tab => self.focus_input = !self.focus_input,
             _ => {}
         }
+    }
+
+    fn clamp_cursor_col(&mut self) {
+        let row_len = self
+            .input
+            .get(self.input_cursor.row)
+            .map(|l| l.chars().count())
+            .unwrap_or(0);
+        self.input_cursor.col = self.input_cursor.col.min(row_len);
     }
 
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
@@ -570,12 +755,12 @@ impl App {
     }
 
     fn submit(&mut self) {
-        let prompt = self.input.trim().to_string();
+        let prompt = self.input_text().trim().to_string();
         if prompt.is_empty() || self.streaming {
             return;
         }
         self.flush_anim(); // la animación nunca bloquea un nuevo prompt
-        self.input.clear();
+        self.clear_input();
         self.push(Role::User, MsgKind::Text, prompt.clone());
         self.streaming = true;
         self.streaming_since = Some(std::time::Instant::now());

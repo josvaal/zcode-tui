@@ -75,8 +75,11 @@ La sesión se crea con tu configuración de providers de ZCode
 | Tecla | Acción |
 |---|---|
 | `Enter` | enviar prompt |
+| `Alt+Enter` | nueva línea (prompt multilinea) |
 | `Ctrl+P` | plan / modelo / nivel de reasoning |
 | `Ctrl+S` | sesiones del workspace (reanudar) |
+| `Ctrl+T` | ciclar tema (dark / tokyo-night / gruvbox) |
+| `o` (con `tab`) | expandir / colapsar tool calls y diffs |
 | `y` / `n` | aprobar / denegar permisos |
 | `Espacio` | saltar animación del thinking |
 | `PgUp/PgDn`, `tab`+`m`+rueda | scroll |
