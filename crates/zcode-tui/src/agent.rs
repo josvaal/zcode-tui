@@ -63,15 +63,51 @@ pub enum AgentEvent {
         summary: String,
         options: Vec<(String, String)>, // (optionId, label)
     },
+    /// El servidor pide una respuesta del usuario (AskUserQuestion / plan).
+    UserInputRequest {
+        token: u64,
+        prompt: String,
+        questions: Vec<UiQuestion>,
+    },
+    /// Uso de tokens de la sesión (respuesta de session/usage).
+    Usage(String),
     /// El mensaje del asistente terminó.
     Done,
     Error(String),
 }
 
+/// Una pregunta del userInput request del server.
+#[derive(Debug, Clone)]
+pub struct UiQuestion {
+    pub question: String,
+    pub header: String,
+    /// (value, label)
+    pub options: Vec<(String, String)>,
+}
+
 enum SessionCmd {
     SendPrompt(String),
     /// Respuesta del usuario a una petición de permiso.
-    PermissionAnswer { token: u64, allow: bool },
+    PermissionAnswer { token: u64, allow: bool, always: bool },
+    /// Respuesta del usuario a un AskUserQuestion.
+    AnswerUserInput {
+        token: u64,
+        accept: bool,
+        /// (header, value) por pregunta
+        answers: Vec<(String, String)>,
+    },
+    /// Interrumpir el turno en curso.
+    Stop,
+    /// Compactar la sesión (/compact).
+    Compact,
+    /// Modo de colaboración: build | edit | plan | yolo.
+    SetMode(String),
+    /// Renombrar la sesión actual.
+    RenameSession(String),
+    /// Borrar la sesión actual.
+    DeleteSession,
+    /// Consultar uso de tokens de la sesión.
+    Usage,
     /// Reanudar una sesión previa.
     ResumeSession { session_id: String },
     /// Cambiar el modelo de la sesión en caliente.
@@ -114,9 +150,54 @@ impl Connector {
     }
 
     /// Responde una petición de permiso pendiente (modo Stdio).
-    pub fn answer_permission(&self, token: u64, allow: bool) {
+    /// `always` agrega regla permanente para la tool (always allow).
+    pub fn answer_permission(&self, token: u64, allow: bool, always: bool) {
         if let Connector::Stdio { cmd_tx } = self {
-            let _ = cmd_tx.send(SessionCmd::PermissionAnswer { token, allow });
+            let _ = cmd_tx.send(SessionCmd::PermissionAnswer { token, allow, always });
+        }
+    }
+
+    pub fn answer_user_input(&self, token: u64, accept: bool, answers: Vec<(String, String)>) {
+        if let Connector::Stdio { cmd_tx } = self {
+            let _ = cmd_tx.send(SessionCmd::AnswerUserInput { token, accept, answers });
+        }
+    }
+
+    /// Interrumpe el turno en curso (session/stop).
+    pub fn stop(&self) {
+        if let Connector::Stdio { cmd_tx } = self {
+            let _ = cmd_tx.send(SessionCmd::Stop);
+        }
+    }
+
+    /// Compacta la sesión (session/compact).
+    pub fn compact(&self) {
+        if let Connector::Stdio { cmd_tx } = self {
+            let _ = cmd_tx.send(SessionCmd::Compact);
+        }
+    }
+
+    pub fn set_mode(&self, mode: String) {
+        if let Connector::Stdio { cmd_tx } = self {
+            let _ = cmd_tx.send(SessionCmd::SetMode(mode));
+        }
+    }
+
+    pub fn rename_session(&self, title: String) {
+        if let Connector::Stdio { cmd_tx } = self {
+            let _ = cmd_tx.send(SessionCmd::RenameSession(title));
+        }
+    }
+
+    pub fn delete_session(&self) {
+        if let Connector::Stdio { cmd_tx } = self {
+            let _ = cmd_tx.send(SessionCmd::DeleteSession);
+        }
+    }
+
+    pub fn request_usage(&self) {
+        if let Connector::Stdio { cmd_tx } = self {
+            let _ = cmd_tx.send(SessionCmd::Usage);
         }
     }
 
@@ -195,8 +276,13 @@ pub async fn connect_stdio(
     agent.send(1, "session/create", &create_params).await?;
     let mut next_id = 2u64;
     let mut perm_token = 0u64;
-    let mut pending_perms: std::collections::HashMap<u64, (serde_json::Value, Vec<(String, String)>)> =
+    let mut pending_perms: std::collections::HashMap<
+        u64,
+        (serde_json::Value, Vec<(String, String)>, String),
+    > = Default::default();
+    let mut pending_user_inputs: std::collections::HashMap<u64, serde_json::Value> =
         Default::default();
+    let mut pending_usage: Option<u64> = None;
     // requestIds de permiso ya mostrados (el server re-envía el mismo request)
     let mut seen_perm_requests: std::collections::BTreeSet<String> = Default::default();
     let mut session_id: Option<String> = None;
@@ -248,11 +334,109 @@ pub async fn connect_stdio(
                             pending_resume = Some((next_id, target));
                             next_id += 1;
                         }
-                        Some(SessionCmd::PermissionAnswer { token, allow }) => {
-                            if let Some((raw_id, _options)) = pending_perms.remove(&token) {
+                        Some(SessionCmd::PermissionAnswer { token, allow, always }) => {
+                            if let Some((raw_id, _options, tool_name)) =
+                                pending_perms.remove(&token)
+                            {
                                 // formato legacy del broker: {decision: allow|deny|escalate|modify}
                                 let decision = if allow { "allow" } else { "deny" };
-                                let _ = agent.respond(&raw_id, json!({ "decision": decision })).await;
+                                let mut response = json!({ "decision": decision });
+                                if allow && always {
+                                    // always allow: regla permanente para esta tool
+                                    response["permissionUpdates"] = json!([{
+                                        "type": "addRules",
+                                        "behavior": "allow",
+                                        "rules": [{ "toolName": tool_name }],
+                                    }]);
+                                }
+                                let _ = agent.respond(&raw_id, response).await;
+                            }
+                        }
+                        Some(SessionCmd::AnswerUserInput { token, accept, answers }) => {
+                            if let Some(raw_id) = pending_user_inputs.remove(&token) {
+                                let mut content = serde_json::Map::new();
+                                for (header, value) in answers {
+                                    content.insert(header, Value::String(value));
+                                }
+                                let response = if accept {
+                                    json!({ "action": "accept", "content": content })
+                                } else {
+                                    json!({ "action": "cancel" })
+                                };
+                                let _ = agent.respond(&raw_id, response).await;
+                            }
+                        }
+                        Some(SessionCmd::Stop) => {
+                            if let Some(sid) = &session_id {
+                                let _ = agent
+                                    .send(
+                                        next_id,
+                                        "session/stop",
+                                        &json!({ "sessionId": sid }),
+                                    )
+                                    .await;
+                                next_id += 1;
+                            }
+                        }
+                        Some(SessionCmd::Compact) => {
+                            if let Some(sid) = &session_id {
+                                let _ = agent
+                                    .send(
+                                        next_id,
+                                        "session/compact",
+                                        &json!({ "sessionId": sid }),
+                                    )
+                                    .await;
+                                next_id += 1;
+                            }
+                        }
+                        Some(SessionCmd::SetMode(mode)) => {
+                            if let Some(sid) = &session_id {
+                                let _ = agent
+                                    .send(
+                                        next_id,
+                                        "session/setMode",
+                                        &json!({ "sessionId": sid, "mode": mode }),
+                                    )
+                                    .await;
+                                next_id += 1;
+                            }
+                        }
+                        Some(SessionCmd::Usage) => {
+                            if let Some(sid) = &session_id {
+                                let _ = agent
+                                    .send(
+                                        next_id,
+                                        "session/usage",
+                                        &json!({ "sessionId": sid }),
+                                    )
+                                    .await;
+                                pending_usage = Some(next_id);
+                                next_id += 1;
+                            }
+                        }
+                        Some(SessionCmd::RenameSession(title)) => {
+                            if let Some(sid) = &session_id {
+                                let _ = agent
+                                    .send(
+                                        next_id,
+                                        "v4/command",
+                                        &command_envelope(sid, "renameSession", json!({ "title": title })),
+                                    )
+                                    .await;
+                                next_id += 1;
+                            }
+                        }
+                        Some(SessionCmd::DeleteSession) => {
+                            if let Some(sid) = &session_id {
+                                let _ = agent
+                                    .send(
+                                        next_id,
+                                        "v4/command",
+                                        &command_envelope(sid, "deleteSession", json!({})),
+                                    )
+                                    .await;
+                                next_id += 1;
                             }
                         }
                         Some(SessionCmd::SendPrompt(content)) => {
@@ -342,6 +526,53 @@ pub async fn connect_stdio(
                             next_id += 1;
                         }
                         Some(ProtocolEvent::Response(id, result)) => {
+                            // respuesta de session/usage → tokens para la status bar
+                            if pending_usage == Some(id) {
+                                pending_usage = None;
+                                if let Ok(r) = &result {
+                                    let grab = |p: &[&str]| {
+                                        for path in p {
+                                            if let Some(n) = r.pointer(path).and_then(|v| v.as_i64()) {
+                                                return Some(n);
+                                            }
+                                        }
+                                        None
+                                    };
+                                    let input = grab(&[
+                                        "/usage/inputTokens",
+                                        "/inputTokens",
+                                        "/usage/promptTokens",
+                                        "/result/usage/inputTokens",
+                                        "/result/inputTokens",
+                                        "/taskTokenUsage/usage/inputTokens",
+                                    ]);
+                                    let output = grab(&[
+                                        "/usage/outputTokens",
+                                        "/outputTokens",
+                                        "/usage/completionTokens",
+                                        "/result/usage/outputTokens",
+                                        "/result/outputTokens",
+                                        "/taskTokenUsage/usage/outputTokens",
+                                    ]);
+                                    let total = grab(&[
+                                        "/usage/totalTokens",
+                                        "/totalTokens",
+                                        "/result/usage/totalTokens",
+                                        "/result/totalTokens",
+                                        "/taskTokenUsage/usage/totalTokens",
+                                    ]);
+                                    let mut parts = Vec::new();
+                                    if let (Some(i), Some(o)) = (input, output) {
+                                        parts.push(format!("{i}↑ {o}↓"));
+                                    }
+                                    if let Some(t) = total {
+                                        parts.push(format!("{t} tok"));
+                                    }
+                                    if !parts.is_empty() {
+                                        let _ = agent_tx.send(AgentEvent::Usage(parts.join(" · ")));
+                                    }
+                                }
+                            }
                             // respuesta de session/list → poblar sidebar
                             if result.is_ok() {
                                 if let Some(arr) = result
@@ -504,12 +735,72 @@ pub async fn connect_stdio(
                                             .collect()
                                     })
                                     .unwrap_or_default();
-                                pending_perms.insert(token, (id.clone(), options.clone()));
+                                pending_perms.insert(
+                                    token,
+                                    (id.clone(), options.clone(), tool_name.clone()),
+                                );
                                 let _ = agent_tx.send(AgentEvent::PermissionRequest {
                                     token,
                                     tool_name,
                                     summary,
                                     options,
+                                });
+                                continue;
+                            }
+                            if method == "interaction/requestUserInput" {
+                                let request_id = req_params
+                                    .get("requestId")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                if !request_id.is_empty()
+                                    && !seen_perm_requests.insert(format!("ui:{request_id}"))
+                                {
+                                    let _ = agent.respond(&id, json!({ "action": "cancel" })).await;
+                                    continue;
+                                }
+                                let prompt = req_params
+                                    .get("prompt")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let questions: Vec<UiQuestion> = req_params
+                                    .get("questions")
+                                    .and_then(|q| q.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .map(|q| UiQuestion {
+                                                question: q.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                header: q.get("header").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                options: q
+                                                    .get("options")
+                                                    .and_then(|o| o.as_array())
+                                                    .map(|opts| {
+                                                        opts.iter()
+                                                            .filter_map(|o| {
+                                                                Some((
+                                                                    o.get("value")?.as_str()?.to_string(),
+                                                                    o.get("label")?.as_str()?.to_string(),
+                                                                ))
+                                                            })
+                                                            .collect()
+                                                    })
+                                                    .unwrap_or_default(),
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                if questions.is_empty() && prompt.is_empty() {
+                                    let _ = agent.respond(&id, json!({ "action": "cancel" })).await;
+                                    continue;
+                                }
+                                perm_token += 1;
+                                let token = perm_token;
+                                pending_user_inputs.insert(token, id.clone());
+                                let _ = agent_tx.send(AgentEvent::UserInputRequest {
+                                    token,
+                                    prompt,
+                                    questions,
                                 });
                                 continue;
                             }
@@ -612,3 +903,54 @@ fn save_last_model(provider_id: &str, model_id: &str, level: Option<&str>) {
 
 #[allow(dead_code)]
 type _KeepOneshot = oneshot::Sender<()>;
+
+/// Envelope v4 para `v4/command` (sin CAS: renameSession/deleteSession no lo exigen).
+fn command_envelope(session_id: &str, cmd_type: &str, payload: serde_json::Value) -> serde_json::Value {
+    let command_id = format!(
+        "019{:08x}-7tui-7{:x}-8{:x}-{:012x}",
+        std::process::id() as u32 & 0xffff_ffff,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() & 0xffff)
+            .unwrap_or(0),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    json!({
+        "commandId": command_id,
+        "clientId": "zcode-tui",
+        "sessionId": session_id,
+        "type": cmd_type,
+        "payload": payload,
+        "issuedAt": iso_now(),
+    })
+}
+
+/// Timestamp RFC3339 UTC sin dependencias.
+fn iso_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // días civiles → (año, mes, día), algoritmo de Howard Hinnant
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mth <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}

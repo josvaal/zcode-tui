@@ -13,6 +13,8 @@ use crate::{
 pub enum Picker {
     Models(usize),
     Levels(crate::agent::ModelInfo, usize),
+    /// modo de colaboración: build/edit/plan/yolo
+    Mode(usize),
 }
 
 /// Modals con búsqueda difusa, estilo opencode.
@@ -31,12 +33,14 @@ pub struct Command {
     pub hint: &'static str,
 }
 
-pub const COMMANDS: [Command; 7] = [
+pub const COMMANDS: [Command; 9] = [
     Command { name: "modelo", hint: "elegir plan/modelo/nivel (ctrl+p)" },
+    Command { name: "modo", hint: "build/edit/plan/yolo (ctrl+o)" },
     Command { name: "sesiones", hint: "listar y reanudar (ctrl+s)" },
     Command { name: "tema", hint: "ciclar tema (ctrl+t)" },
     Command { name: "tools", hint: "expandir/colapsar tools y diffs (o)" },
     Command { name: "archivos", hint: "buscar archivo del workspace (@)" },
+    Command { name: "compact", hint: "compactar el contexto de la sesión" },
     Command { name: "limpiar", hint: "vaciar el transcript" },
     Command { name: "salir", hint: "cerrar la TUI" },
 ];
@@ -71,6 +75,14 @@ pub struct InputCursor {
     pub row: usize,
 }
 
+/// Pregunta de userInput activa con el estado de selección.
+pub struct UserInputPending {
+    pub token: u64,
+    pub questions: Vec<crate::agent::UiQuestion>,
+    pub question_idx: usize,
+    pub option_idx: usize,
+}
+
 pub struct App {
     pub theme: Theme,
     pub streaming_since: Option<std::time::Instant>,
@@ -85,6 +97,18 @@ pub struct App {
     pub streaming: bool,
     /// tick para el spinner del status bar (avanza con el redibujo de 50ms)
     pub tick: usize,
+    /// prompts encolados mientras el agente trabaja
+    pub queue: Vec<String>,
+    /// modo de colaboración actual: build | edit | plan | yolo
+    pub mode: String,
+    /// uso de tokens de la sesión (de session/usage)
+    pub usage_text: Option<String>,
+    /// AskUserQuestion pendiente: (token, pregunta actual, opción elegida por pregunta)
+    pub pending_user_input: Option<UserInputPending>,
+    /// buffer de renombrado de sesión (sidebar, tecla r)
+    pub rename: Option<String>,
+    /// confirmación de borrado en la sidebar (segundo `d`)
+    pub delete_armed: bool,
     pub connector: Connector,
     pub user_label: String,
     pub should_quit: bool,
@@ -130,6 +154,12 @@ impl App {
             focus_input: true,
             streaming: false,
             tick: 0,
+            queue: Vec::new(),
+            mode: "build".into(),
+            usage_text: None,
+            pending_user_input: None,
+            rename: None,
+            delete_armed: false,
             connector,
             user_label: "tú".into(),
             should_quit: false,
@@ -333,6 +363,11 @@ impl App {
                 if !self.models.is_empty() {
                     self.picker = Some(Picker::Models(0));
                 }
+            }
+            "modo" => self.picker = Some(Picker::Mode(0)),
+            "compact" => {
+                self.connector.compact();
+                self.push(Role::System, MsgKind::Text, "compactando el contexto de la sesión…");
             }
             "sesiones" => {
                 if !self.sessions.is_empty() {
@@ -548,6 +583,42 @@ impl App {
                             self.streaming = false;
                             self.streaming_since = None;
                             self.collapse_tools();
+                            // drenar la cola de prompts: el siguiente sale solo
+                            if !self.queue.is_empty() {
+                                let next = self.queue.remove(0);
+                                self.push(Role::User, MsgKind::Text, next.clone());
+                                self.streaming = true;
+                                self.streaming_since = Some(std::time::Instant::now());
+                                self.hint_shown = false;
+                                self.tool_msg_index.clear();
+                                self.auto_scroll = true;
+                                if let Some(tx) = self.event_tx.clone() {
+                                    self.connector.send(next, tx);
+                                }
+                            } else {
+                                self.connector.request_usage();
+                            }
+                        }
+                        Some(AgentEvent::Usage(u)) => {
+                            self.usage_text = Some(u);
+                        }
+                        Some(AgentEvent::UserInputRequest { token, prompt, questions }) => {
+                            let summary = questions
+                                .first()
+                                .map(|q| q.question.clone())
+                                .unwrap_or(prompt);
+                            let n_opts = questions.first().map(|q| q.options.len()).unwrap_or(0);
+                            self.push(
+                                Role::System,
+                                MsgKind::Text,
+                                format!("❓ {summary} — elige 1-{n_opts} (esc cancela)"),
+                            );
+                            self.pending_user_input = Some(UserInputPending {
+                                token,
+                                questions,
+                                question_idx: 0,
+                                option_idx: 0,
+                            });
                         }
                         Some(AgentEvent::Error(e)) => {
                             self.push(Role::System, MsgKind::Text, format!("error: {e}"));
@@ -642,6 +713,44 @@ impl App {
             self.push(Role::System, MsgKind::Text, format!("tema → {}", self.theme.name));
             return;
         }
+        // Ctrl+O: picker de modo (build/edit/plan/yolo) — Ctrl+M es Enter en terminals
+        if ctrl && key.code == KeyCode::Char('o') {
+            self.picker = if self.picker.is_some() {
+                None
+            } else {
+                Some(Picker::Mode(0))
+            };
+            return;
+        }
+        // renombrado de sesión en curso (sidebar + r): captura el teclado
+        if let Some(buf) = self.rename.clone() {
+            match key.code {
+                KeyCode::Enter => {
+                    let title = buf.trim().to_string();
+                    self.rename = None;
+                    if !title.is_empty() {
+                        if let Some(idx) = self.sidebar {
+                            if let Some(si) = self.sessions.get_mut(idx) {
+                                si.title = title.clone();
+                            }
+                        }
+                        self.connector.rename_session(title);
+                        self.push(Role::System, MsgKind::Text, "sesión renombrada");
+                    }
+                }
+                KeyCode::Esc => self.rename = None,
+                KeyCode::Backspace => {
+                    let mut b = buf;
+                    b.pop();
+                    self.rename = Some(b);
+                }
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    self.rename = Some(format!("{buf}{c}"));
+                }
+                _ => {}
+            }
+            return;
+        }
         // navegación de la sidebar
         if let Some(idx) = self.sidebar {
             match key.code {
@@ -676,6 +785,44 @@ impl App {
                 }
                 KeyCode::Esc => {
                     self.sidebar = None;
+                    self.delete_armed = false;
+                    return;
+                }
+                // r renombra la sesión seleccionada
+                KeyCode::Char('r') => {
+                    if self.sessions.get(idx).is_some() {
+                        let current = self
+                            .sessions
+                            .get(idx)
+                            .map(|si| si.title.clone())
+                            .unwrap_or_default();
+                        self.rename = Some(current);
+                    }
+                    return;
+                }
+                // d dos veces borra la sesión (la segunda confirma)
+                KeyCode::Char('d') => {
+                    if self.delete_armed {
+                        self.delete_armed = false;
+                        if let Some(si) = self.sessions.get(idx).cloned() {
+                            if self.current_session.as_deref() == Some(si.session_id.as_str()) {
+                                self.connector.delete_session();
+                                self.messages.clear();
+                                self.tool_msg_index.clear();
+                                self.current_session = None;
+                            }
+                            self.sessions.remove(idx);
+                            if self.sessions.is_empty() {
+                                self.sidebar = None;
+                            } else {
+                                self.sidebar = Some(idx.min(self.sessions.len() - 1));
+                            }
+                            self.push(Role::System, MsgKind::Text, "sesión borrada");
+                        }
+                    } else {
+                        self.delete_armed = true;
+                        self.push(Role::System, MsgKind::Text, "d de nuevo confirma el borrado");
+                    }
                     return;
                 }
                 _ => {}
@@ -759,9 +906,29 @@ impl App {
                     }
                     return;
                 }
+                Picker::Mode(idx) => {
+                    const MODES: [&str; 4] = ["build", "edit", "plan", "yolo"];
+                    match key.code {
+                        KeyCode::Up => {
+                            self.picker = Some(Picker::Mode(idx.saturating_sub(1)));
+                        }
+                        KeyCode::Down => {
+                            self.picker = Some(Picker::Mode((*idx + 1).min(3)));
+                        }
+                        KeyCode::Enter => {
+                            let mode = MODES.get(*idx).copied().unwrap_or("build").to_string();
+                            self.connector.set_mode(mode.clone());
+                            self.mode = mode.clone();
+                            self.push(Role::System, MsgKind::Text, format!("modo → {mode}"));
+                            self.picker = None;
+                        }
+                        KeyCode::Esc => self.picker = None,
+                        _ => {}
+                    }
+                    return;
+                }
             }
         }
-        // modal abierto: la captura de teclas es suya (búsqueda difusa)
         if self.modal.is_some() {
             match key.code {
                 KeyCode::Up => {
@@ -828,6 +995,34 @@ impl App {
             self.toggle_tools();
             return;
         }
+        // c copia la última respuesta del asistente (OSC52)
+        if key.code == KeyCode::Char('c') && !self.focus_input && !ctrl {
+            if let Some(last) = self
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::Assistant && m.kind == MsgKind::Text)
+            {
+                copy_to_clipboard(&last.content);
+                self.push(Role::System, MsgKind::Text, "respuesta copiada al portapapeles");
+            }
+            return;
+        }
+        // e edita el último prompt: lo carga en el input para modificarlo y reenviar
+        if key.code == KeyCode::Char('e') && !self.focus_input && !self.streaming {
+            if let Some(last) = self.messages.iter().rev().find(|m| m.role == Role::User) {
+                self.input = last.content.lines().map(|l| l.to_string()).collect();
+                if self.input.is_empty() {
+                    self.input = vec![String::new()];
+                }
+                self.input_cursor = InputCursor {
+                    row: self.input.len() - 1,
+                    col: self.input.last().map(|l| l.chars().count()).unwrap_or(0),
+                };
+                self.focus_input = true;
+            }
+            return;
+        }
         // m alterna la rueda del mouse (y con ella, la selección de texto)
         if key.code == KeyCode::Char('m') && !self.focus_input {
             self.mouse_capture = !self.mouse_capture;
@@ -844,30 +1039,98 @@ impl App {
             self.flush_anim();
             return;
         }
-        // permiso pendiente: y/n responden directamente
+        // permiso pendiente: y/n/a responden directamente
         if let Some((token, _)) = self.pending_permission {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.pending_permission = None;
-                    if let Some(tx) = self.event_tx.clone() {
-                        // reutilizamos cmd_tx vía Connector
-                        self.connector.answer_permission(token, true);
-                        let _ = tx;
-                    }
+                    self.connector.answer_permission(token, true, false);
+                    return;
+                }
+                // always allow: regla permanente para esta tool
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.pending_permission = None;
+                    self.connector.answer_permission(token, true, true);
+                    self.push(Role::System, MsgKind::Text, "permitido siempre para esta tool");
                     return;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.pending_permission = None;
-                    self.connector.answer_permission(token, false);
+                    self.connector.answer_permission(token, false, false);
                     return;
                 }
                 KeyCode::Esc => {
                     self.pending_permission = None;
-                    self.connector.answer_permission(token, false);
+                    self.connector.answer_permission(token, false, false);
                     return;
                 }
                 _ => {}
             }
+        }
+        // AskUserQuestion pendiente: 1-9 elige, ↑↓ cambia de pregunta, esc cancela
+        if self.pending_user_input.is_some() {
+            let n_questions = self
+                .pending_user_input
+                .as_ref()
+                .map(|ui| ui.questions.len())
+                .unwrap_or(0);
+            let mut accept = false;
+            let mut cancel = false;
+            match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                    if let Some(ui) = &mut self.pending_user_input {
+                        let idx = c.to_digit(10).unwrap_or(1) as usize - 1;
+                        if let Some(q) = ui.questions.get(ui.question_idx) {
+                            if idx < q.options.len() {
+                                ui.option_idx = idx;
+                                accept = true;
+                            }
+                        }
+                    }
+                }
+                KeyCode::Up => {
+                    if let Some(ui) = &mut self.pending_user_input {
+                        ui.question_idx = ui.question_idx.saturating_sub(1);
+                        ui.option_idx = 0;
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(ui) = &mut self.pending_user_input {
+                        if ui.question_idx + 1 < n_questions {
+                            ui.question_idx += 1;
+                            ui.option_idx = 0;
+                        }
+                    }
+                }
+                KeyCode::Enter => accept = true,
+                KeyCode::Esc => cancel = true,
+                _ => {}
+            }
+            if accept || cancel {
+                if let Some(ui) = self.pending_user_input.take() {
+                    let answers: Vec<(String, String)> = ui
+                        .questions
+                        .iter()
+                        .enumerate()
+                        .map(|(qi, q)| {
+                            let oi = if qi == ui.question_idx {
+                                ui.option_idx
+                            } else {
+                                0
+                            };
+                            let value = q
+                                .options
+                                .get(oi)
+                                .map(|(v, _)| v.clone())
+                                .unwrap_or_default();
+                            (q.header.clone(), value)
+                        })
+                        .collect();
+                    self.connector
+                        .answer_user_input(ui.token, accept && !cancel, answers);
+                }
+            }
+            return;
         }
         // PgUp/PgDown hacen scroll siempre, sin importar el foco
         if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
@@ -950,6 +1213,11 @@ impl App {
                     .map(|l| l.chars().count())
                     .unwrap_or(0);
             }
+            // Esc interrumpe el turno si está trabajando; si no, limpia el input
+            KeyCode::Esc if self.streaming => {
+                self.connector.stop();
+                self.push(Role::System, MsgKind::Text, "⏹ interrumpiendo turno…");
+            }
             KeyCode::Esc => self.clear_input(),
             KeyCode::Tab => self.focus_input = !self.focus_input,
             _ => {}
@@ -1003,7 +1271,18 @@ impl App {
 
     fn submit(&mut self) {
         let mut prompt = self.input_text().trim().to_string();
-        if prompt.is_empty() || self.streaming {
+        if prompt.is_empty() {
+            return;
+        }
+        // trabajando: el prompt se encola (estilo Desktop) y sale al terminar
+        if self.streaming {
+            self.queue.push(prompt);
+            self.clear_input();
+            self.push(
+                Role::System,
+                MsgKind::Text,
+                format!("encolado ({} en cola) — saldrá al terminar el turno", self.queue.len()),
+            );
             return;
         }
         // `$skill args` → prompt que le pide al agente cargar esa skill
@@ -1047,4 +1326,30 @@ impl App {
             self.connector.send(prompt, tx);
         }
     }
+}
+
+/// Copia al portapapeles del terminal con OSC52 (sin dependencias).
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write as _;
+    let bytes = text.as_bytes();
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        b64.push(TABLE[(b[0] >> 2) as usize] as char);
+        b64.push(TABLE[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        b64.push(if chunk.len() > 1 {
+            TABLE[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        b64.push(if chunk.len() > 2 { TABLE[(b[2] & 0x3f) as usize] as char } else { '=' });
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{b64}\x07");
+    let _ = out.flush();
 }

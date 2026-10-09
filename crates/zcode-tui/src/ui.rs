@@ -46,6 +46,61 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, theme, status);
     draw_model_picker(f, app, theme, area);
     draw_modal(f, app, theme, area);
+    draw_user_input(f, app, theme, area);
+}
+
+/// Modal de AskUserQuestion: pregunta(s) con opciones numeradas.
+fn draw_user_input(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
+    use ratatui::widgets::Clear;
+    let Some(ui) = &app.pending_user_input else { return };
+    let Some(q) = ui.questions.get(ui.question_idx) else { return };
+
+    let mut lines: Vec<Line> = Vec::new();
+    if ui.questions.len() > 1 {
+        lines.push(Line::from(Span::styled(
+            format!(" pregunta {}/{}", ui.question_idx + 1, ui.questions.len()),
+            Style::new().fg(theme.muted),
+        )));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("❓ ", Style::new().fg(theme.warning).add_modifier(Modifier::BOLD)),
+        Span::styled(q.question.clone(), Style::new().fg(theme.fg).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::default());
+    for (i, (_value, label)) in q.options.iter().enumerate() {
+        let selected = i == ui.option_idx;
+        let style = if selected {
+            Style::new().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme.fg)
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" {} {} ", i + 1, label),
+            style,
+        )));
+    }
+    lines.push(Line::default());
+    let hint = if ui.questions.len() > 1 {
+        "1-9: elegir · ↑↓: pregunta · esc: cancelar "
+    } else {
+        "1-9: elegir · esc: cancelar "
+    };
+    lines.push(Line::from(Span::styled(hint, Style::new().fg(theme.muted))));
+
+    let width = (area.width.saturating_sub(8)).min(70).max(34);
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)).max(1) / 2;
+    let popup = Rect { x, y, width, height };
+    f.render_widget(Clear, popup);
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::new().fg(theme.warning))
+            .title(Span::styled(" input requerido ", Style::new().fg(theme.warning))),
+    );
+    f.render_widget(para, popup);
 }
 
 /// Modal genérico con búsqueda difusa (comandos `/`, archivos `@`, skills `$`).
@@ -139,7 +194,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
                 .border_type(ratatui::widgets::BorderType::Rounded)
                 .border_style(Style::new().fg(theme.border_active))
                 .title(Span::styled(
-                    " sesiones — enter: reanudar · esc: cerrar ",
+                    " sesiones — enter: reanudar · r: renombrar · d×2: borrar · esc: cerrar ",
                     Style::new().fg(theme.accent),
                 )),
         )
@@ -213,11 +268,41 @@ fn draw_model_picker(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
                 *selected,
             )
         }
+        crate::app::Picker::Mode(selected) => {
+            const MODES: [(&str, &str); 4] = [
+                ("build", "pregunta antes de cambios"),
+                ("edit", "edita archivos automáticamente"),
+                ("plan", "solo planifica, no ejecuta"),
+                ("yolo", "acceso total, sin permisos"),
+            ];
+            let items: Vec<ListItem> = MODES
+                .iter()
+                .map(|(name, hint)| {
+                    let is_current = *name == app.mode;
+                    let marker = if is_current { "● " } else { "  " };
+                    ListItem::new(ratatui::text::Line::from(vec![
+                        Span::styled(
+                            format!(" {marker}{name} "),
+                            Style::new()
+                                .fg(theme.fg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("— {hint} "), Style::new().fg(theme.muted)),
+                    ]))
+                })
+                .collect();
+            (
+                " modo — enter: aplicar · esc: cerrar ".to_string(),
+                items,
+                *selected,
+            )
+        }
     };
 
     let rows = match picker {
         crate::app::Picker::Models(_) => app.models.len() as u16,
         crate::app::Picker::Levels(_, _) => app.reasoning_levels.len() as u16,
+        crate::app::Picker::Mode(_) => 4,
     };
     let width = (area.width.saturating_sub(8)).min(72).max(30);
     let height = (rows + 4).min(area.height.saturating_sub(4));
@@ -481,6 +566,11 @@ fn draw_status(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
     };
     let mut spans = vec![
         Span::styled(format!(" {mode} "), Style::new().fg(theme.bg).bg(theme.accent)),
+        // chip del modo de colaboración
+        Span::styled(
+            format!(" {} ", app.mode),
+            Style::new().fg(theme.bg).bg(theme.tool),
+        ),
         Span::raw(" "),
     ];
     if app.streaming {
@@ -490,18 +580,30 @@ fn draw_status(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
             .unwrap_or(0);
         let frame = SPINNER[app.tick % SPINNER.len()];
         spans.push(Span::styled(
-            format!("{frame} trabajando · {secs}s"),
+            format!("{frame} trabajando · {secs}s · esc detiene"),
             Style::new().fg(theme.accent),
         ));
     } else {
         spans.push(Span::styled("○ listo", Style::new().fg(theme.muted)));
+    }
+    if !app.queue.is_empty() {
+        spans.push(Span::styled(
+            format!(" · en cola: {}", app.queue.len()),
+            Style::new().fg(theme.warning),
+        ));
+    }
+    if let Some(usage) = &app.usage_text {
+        spans.push(Span::styled(
+            format!(" · {usage}"),
+            Style::new().fg(theme.muted),
+        ));
     }
     spans.push(Span::styled(
         format!("  · tema: {}", theme.name),
         Style::new().fg(theme.muted),
     ));
     spans.push(Span::styled(
-        "  · ctrl+p:modelo ctrl+s:sesiones o:tools q:salir",
+        "  · /:comandos @:archivos $:skills ctrl+o:modo",
         Style::new().fg(theme.muted),
     ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
