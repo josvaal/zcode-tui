@@ -396,7 +396,13 @@ impl App {
                             self.current_session = Some(sid);
                         }
                         Some(AgentEvent::HistoryUser(text)) => {
-                            self.push(Role::User, MsgKind::Text, text)
+                            // el prompt recién enviado ya está en el transcript;
+                            // los frames v4 lo re-entregan → no duplicar
+                            let dup = matches!(self.messages.last(),
+                                Some(m) if m.role == Role::User && m.content == text);
+                            if !dup {
+                                self.push(Role::User, MsgKind::Text, text)
+                            }
                         }
                         None => {}
                     }

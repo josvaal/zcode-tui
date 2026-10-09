@@ -337,9 +337,15 @@ impl FrameProjector {
         }
         if kind == "userInput" {
             let row_id = row.get("rowId").and_then(|v| v.as_i64()).unwrap_or(-1);
+            // dedupe por fila: initial/online/recovery re-entregan userInput
+            // (el prompt ya se muestra localmente al enviarlo)
+            if self.row_emitted.contains_key(&row_id) {
+                return;
+            }
             self.row_kinds.insert(row_id, kind.clone());
             let text = row.get("text").and_then(|t| t.as_str()).unwrap_or_default();
             if !text.is_empty() {
+                self.row_emitted.insert(row_id, text.chars().count());
                 let _ = tx.send(AgentEvent::HistoryUser(text.to_string()));
             }
             return;
