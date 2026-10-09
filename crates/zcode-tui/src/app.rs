@@ -231,7 +231,7 @@ impl App {
         self.messages.push(Message {
             role,
             kind,
-            content: content.into(),
+            content: cap_content(&content.into()),
             expanded: true,
         });
     }
@@ -681,6 +681,7 @@ impl App {
         if let Some(last) = self.messages.last_mut() {
             if last.role == Role::Assistant && last.kind == kind {
                 last.content.push_str(delta);
+                last.content = cap_content(&last.content);
                 return;
             }
         }
@@ -1326,6 +1327,33 @@ impl App {
             self.connector.send(prompt, tx);
         }
     }
+}
+
+/// Tope de contenido por mensaje: sin esto, un thinking que cita un archivo
+/// minificado de miles de líneas congela el render del transcript.
+const MAX_MSG_LINES: usize = 400;
+const MAX_MSG_CHARS: usize = 24_000;
+
+fn cap_content(content: &str) -> String {
+    let total_lines = content.lines().count();
+    let total_chars = content.chars().count();
+    if total_lines <= MAX_MSG_LINES && total_chars <= MAX_MSG_CHARS {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(MAX_MSG_CHARS.min(total_chars) + 80);
+    let mut lines = 0;
+    for line in content.lines() {
+        if lines >= MAX_MSG_LINES || out.chars().count() > MAX_MSG_CHARS {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+        lines += 1;
+    }
+    out.push_str(&format!(
+        "… [truncado: {total_lines} líneas / {total_chars} caracteres en el mensaje original]"
+    ));
+    out
 }
 
 /// Copia al portapapeles del terminal con OSC52 (sin dependencias).
