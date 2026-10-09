@@ -177,44 +177,67 @@ fn draw_model_picker(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
 }
 
 /// Pantalla de bienvenida: solo se ve cuando el transcript está vacío.
-fn welcome_lines(theme: Theme, width: u16) -> Vec<Line<'static>> {
-    let pad = (width as usize / 2).saturating_sub(26);
-    let blank = Line::default();
-    let mut out = vec![blank.clone(); 2.min(usize::from(width > 10))];
-    for line in [
-        "   ╭───────────────────────────────────────────╮",
-        "   │                                           │",
-        &format!("   │   {:^39}   │", "zcode-tui"),
-        &format!("   │   {:^39}   │", "agente de código en tu terminal"),
-        "   │                                           │",
-        &format!("   │   {:^39}   │", "enter: enviar · ctrl+p: modelo"),
-        &format!("   │   {:^39}   │", "ctrl+s: sesiones · ctrl+t: tema"),
-        &format!("   │   {:^39}   │", "o: ver/ocultar herramientas"),
-        "   │                                           │",
-        "   ╰───────────────────────────────────────────╯",
-        "",
-        &format!("   {:>pad$}{}", "", "escribe un prompt y presiona enter", pad = pad + 3),
-    ] {
-        out.push(Line::from(Span::styled(line.to_string(), Style::new().fg(theme.border))));
+fn welcome_lines(theme: Theme) -> Vec<Line<'static>> {
+    fn center(text: &str, width: usize) -> String {
+        let len = text.chars().count();
+        let left = (width - len) / 2;
+        format!("{}{}{}", " ".repeat(left), text, " ".repeat(width - len - left))
     }
+    const W: usize = 37;
+    let body = [
+        center("zcode-tui", W),
+        center("agente de código en tu terminal", W),
+        String::new(),
+        center("enter: enviar · ctrl+p: modelo", W),
+        center("ctrl+s: sesiones · ctrl+t: tema", W),
+        center("o: ver/ocultar herramientas", W),
+    ];
+    let mut out = vec![Line::default(), Line::default()];
+    out.push(Line::from(Span::styled(
+        format!("   ╭─{}─╮", "─".repeat(W)),
+        Style::new().fg(theme.border),
+    )));
+    out.push(Line::from(Span::styled(
+        format!("   │ {} │", " ".repeat(W)),
+        Style::new().fg(theme.border),
+    )));
+    for (i, row) in body.iter().enumerate() {
+        let style = if i == 0 {
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(if row.is_empty() { theme.border } else { theme.muted })
+        };
+        out.push(Line::from(Span::styled(
+            format!("   │ {} │", row),
+            style,
+        )));
+    }
+    out.push(Line::from(Span::styled(
+        format!("   │ {} │", " ".repeat(W)),
+        Style::new().fg(theme.border),
+    )));
+    out.push(Line::from(Span::styled(
+        format!("   ╰─{}─╯", "─".repeat(W)),
+        Style::new().fg(theme.border),
+    )));
     out
 }
 
 fn draw_transcript(f: &mut Frame, app: &mut App, theme: Theme, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     if app.messages.is_empty() {
-        lines.extend(welcome_lines(theme, area.width));
+        lines.extend(welcome_lines(theme));
     } else {
         for msg in &app.messages {
             match msg.role {
                 crate::app::Role::User => {
-                    lines.push(Line::from(Span::styled(
-                        "❯".to_string(),
+                    // marcador y texto en la misma línea
+                    let mut spans = vec![Span::styled(
+                        "❯ ".to_string(),
                         Style::new()
                             .fg(theme.user)
                             .add_modifier(Modifier::BOLD),
-                    )));
-                    let mut spans = vec![Span::raw(" ")];
+                    )];
                     spans.extend(markdown::inline(&msg.content, &theme));
                     lines.push(Line::from(spans));
                     lines.push(Line::default());
