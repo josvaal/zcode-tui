@@ -75,6 +75,9 @@ La sesión se crea con tu configuración de providers de ZCode
 | Tecla | Acción |
 |---|---|
 | `Enter` | enviar prompt |
+| `/` (prompt vacío) | paleta de comandos con búsqueda difusa |
+| `@` | file picker del workspace (inserta la ruta en el prompt) |
+| `$` (prompt vacío) | skills: elige una y se invoca al enviar |
 | `Alt+Enter` | nueva línea (prompt multilinea) |
 | `Ctrl+P` | plan / modelo / nivel de reasoning |
 | `Ctrl+S` | sesiones del workspace (reanudar) |

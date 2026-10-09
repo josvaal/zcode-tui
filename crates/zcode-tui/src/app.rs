@@ -15,6 +15,32 @@ pub enum Picker {
     Levels(crate::agent::ModelInfo, usize),
 }
 
+/// Modals con búsqueda difusa, estilo opencode.
+#[derive(Clone)]
+pub enum Modal {
+    /// `/` paleta de comandos
+    Commands { sel: usize, query: String },
+    /// `@` archivos del workspace
+    Files { sel: usize, query: String },
+    /// `$` skills
+    Skills { sel: usize, query: String },
+}
+
+pub struct Command {
+    pub name: &'static str,
+    pub hint: &'static str,
+}
+
+pub const COMMANDS: [Command; 7] = [
+    Command { name: "modelo", hint: "elegir plan/modelo/nivel (ctrl+p)" },
+    Command { name: "sesiones", hint: "listar y reanudar (ctrl+s)" },
+    Command { name: "tema", hint: "ciclar tema (ctrl+t)" },
+    Command { name: "tools", hint: "expandir/colapsar tools y diffs (o)" },
+    Command { name: "archivos", hint: "buscar archivo del workspace (@)" },
+    Command { name: "limpiar", hint: "vaciar el transcript" },
+    Command { name: "salir", hint: "cerrar la TUI" },
+];
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Role {
     User,
@@ -67,6 +93,14 @@ pub struct App {
     pub models: Vec<ModelInfo>,
     /// picker abierto: lista de modelos o selector de nivel para uno elegido
     pub picker: Option<Picker>,
+    /// modal abierto: comandos /, archivos @, skills $
+    pub modal: Option<Modal>,
+    /// archivos del workspace (lazy, para el modal @)
+    pub files: Vec<String>,
+    /// skills descubiertas (lazy, para el modal $)
+    pub skills: Vec<crate::modal::SkillInfo>,
+    /// workspace raíz (descubrimiento de archivos/skills)
+    pub workspace: std::path::PathBuf,
     pub sessions: Vec<SessionInfo>,
     /// sidebar de sesiones abierta con índice seleccionado
     pub sidebar: Option<usize>,
@@ -83,7 +117,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(connector: Connector) -> App {
+    pub fn new(connector: Connector, workspace: String) -> App {
         App {
             theme: crate::theme::load(),
             streaming_since: None,
@@ -105,6 +139,10 @@ impl App {
             activity_since_prompt: false,
             models: Vec::new(),
             picker: None,
+            modal: None,
+            files: Vec::new(),
+            skills: Vec::new(),
+            workspace: std::path::PathBuf::from(&workspace),
             sessions: Vec::new(),
             sidebar: None,
             current_session: None,
@@ -194,6 +232,136 @@ impl App {
     /// Texto del prompt listo para enviar (líneas unidas).
     fn input_text(&self) -> String {
         self.input.join("\n")
+    }
+
+    /// Ítems a mostrar en el modal abierto (ya con formato de display).
+    pub fn modal_items(&self) -> Vec<String> {
+        match &self.modal {
+            Some(Modal::Commands { .. }) => COMMANDS
+                .iter()
+                .map(|c| format!("{}  —  {}", c.name, c.hint))
+                .collect(),
+            Some(Modal::Files { .. }) => self.files.clone(),
+            Some(Modal::Skills { .. }) => self
+                .skills
+                .iter()
+                .map(|s| {
+                    if s.description.is_empty() {
+                        s.name.clone()
+                    } else {
+                        format!("{}  —  {}", s.name, s.description)
+                    }
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Índices filtrados por la query del modal (fuzzy, ordenados por puntaje).
+    pub fn modal_filtered(&self) -> Vec<usize> {
+        let query = match &self.modal {
+            Some(Modal::Commands { query, .. })
+            | Some(Modal::Files { query, .. })
+            | Some(Modal::Skills { query, .. }) => query.as_str(),
+            None => "",
+        };
+        let items = self.modal_items();
+        crate::modal::filter_indices(query, &items)
+    }
+
+    fn modal_query_mut(&mut self) -> Option<&mut String> {
+        match &mut self.modal {
+            Some(Modal::Commands { query, .. })
+            | Some(Modal::Files { query, .. })
+            | Some(Modal::Skills { query, .. }) => Some(query),
+            None => None,
+        }
+    }
+
+    /// Enter en el modal: ejecutar comando / insertar path / insertar skill.
+    fn modal_pick(&mut self) {
+        let filtered = self.modal_filtered();
+        let sel = match &self.modal {
+            Some(Modal::Commands { sel, .. })
+            | Some(Modal::Files { sel, .. })
+            | Some(Modal::Skills { sel, .. }) => *sel,
+            None => return,
+        };
+        let items = self.modal_items();
+        let Some(&idx) = filtered.get(sel) else { return };
+        let chosen = items[idx].clone();
+        match &self.modal {
+            Some(Modal::Commands { .. }) => {
+                let name = chosen.split("  —  ").next().unwrap_or("").to_string();
+                self.modal = None;
+                self.run_command(&name);
+            }
+            Some(Modal::Files { .. }) => {
+                // insertar el path relativo en el cursor del prompt
+                let path = chosen.clone();
+                self.modal = None;
+                self.insert_input(&path);
+                self.insert_input(" ");
+            }
+            Some(Modal::Skills { .. }) => {
+                let name = chosen.split("  —  ").next().unwrap_or("").to_string();
+                self.modal = None;
+                self.insert_input(&format!("${name} "));
+            }
+            None => {}
+        }
+    }
+
+    fn open_files_modal(&mut self) {
+        if self.files.is_empty() {
+            self.files = crate::modal::discover_files(&self.workspace);
+        }
+        self.modal = Some(Modal::Files { sel: 0, query: String::new() });
+    }
+
+    fn open_skills_modal(&mut self) {
+        if self.skills.is_empty() {
+            self.skills = crate::modal::discover_skills(&self.workspace);
+        }
+        self.modal = Some(Modal::Skills { sel: 0, query: String::new() });
+    }
+
+    /// Ejecuta un comando de la paleta `/`.
+    fn run_command(&mut self, name: &str) {
+        match name {
+            "modelo" => {
+                if !self.models.is_empty() {
+                    self.picker = Some(Picker::Models(0));
+                }
+            }
+            "sesiones" => {
+                if !self.sessions.is_empty() {
+                    self.sidebar = Some(0);
+                }
+            }
+            "tema" => {
+                self.theme = crate::theme::next(self.theme);
+                crate::theme::save(self.theme);
+                self.push(Role::System, MsgKind::Text, format!("tema → {}", self.theme.name));
+            }
+            "tools" => self.toggle_tools(),
+            "archivos" => {
+                if self.input_text().trim().is_empty() {
+                    self.insert_input("@");
+                }
+                self.open_files_modal();
+            }
+            "limpiar" => {
+                self.messages.clear();
+                self.tool_msg_index.clear();
+                self.anim_buffer.clear();
+                self.scroll = 0;
+                self.auto_scroll = true;
+                self.push(Role::System, MsgKind::Text, "transcript limpiado");
+            }
+            "salir" => self.should_quit = true,
+            _ => {}
+        }
     }
 
     fn clear_input(&mut self) {
@@ -587,6 +755,68 @@ impl App {
                 }
             }
         }
+        // modal abierto: la captura de teclas es suya (búsqueda difusa)
+        if self.modal.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(m) = &mut self.modal {
+                        let sel = match m {
+                            Modal::Commands { sel, .. }
+                            | Modal::Files { sel, .. }
+                            | Modal::Skills { sel, .. } => sel,
+                        };
+                        *sel = sel.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    let n = self.modal_filtered().len();
+                    if n > 0 {
+                        if let Some(m) = &mut self.modal {
+                            let sel = match m {
+                                Modal::Commands { sel, .. }
+                                | Modal::Files { sel, .. }
+                                | Modal::Skills { sel, .. } => sel,
+                            };
+                            *sel = (*sel + 1).min(n - 1);
+                        }
+                    }
+                }
+                KeyCode::Enter => self.modal_pick(),
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Backspace => {
+                    if let Some(q) = self.modal_query_mut() {
+                        q.pop();
+                    }
+                }
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    if let Some(q) = self.modal_query_mut() {
+                        q.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        // `/` con el prompt vacío abre la paleta de comandos
+        if key.code == KeyCode::Char('/')
+            && !ctrl
+            && !alt
+            && self.focus_input
+            && self.input_text().trim().is_empty()
+        {
+            self.modal = Some(Modal::Commands { sel: 0, query: String::new() });
+            return;
+        }
+        // `$` con el prompt vacío abre el modal de skills
+        if key.code == KeyCode::Char('$')
+            && !ctrl
+            && !alt
+            && self.focus_input
+            && self.input_text().trim().is_empty()
+        {
+            self.open_skills_modal();
+            return;
+        }
         // o expande/colapsa los tool calls y diffs (fuera del input)
         if key.code == KeyCode::Char('o') && !self.focus_input {
             self.toggle_tools();
@@ -646,6 +876,11 @@ impl App {
             // Alt+Enter: nueva línea en el prompt
             KeyCode::Enter if alt => self.split_line_at_cursor(),
             KeyCode::Enter => self.submit(),
+            // `@` en el prompt: insertarlo y abrir el file picker
+            KeyCode::Char('@') if !ctrl && !alt && self.focus_input => {
+                self.insert_input("@");
+                self.open_files_modal();
+            }
             KeyCode::Char(c) if !ctrl && !alt => self.insert_input(&c.to_string()),
             KeyCode::Backspace => {
                 let row = self.input_cursor.row;
@@ -761,9 +996,36 @@ impl App {
     }
 
     fn submit(&mut self) {
-        let prompt = self.input_text().trim().to_string();
+        let mut prompt = self.input_text().trim().to_string();
         if prompt.is_empty() || self.streaming {
             return;
+        }
+        // `$skill args` → prompt que le pide al agente cargar esa skill
+        if let Some(body) = prompt.strip_prefix('$') {
+            let (name, rest) = match body.split_once(' ') {
+                Some((n, r)) => (n, r.trim()),
+                None => (body, ""),
+            };
+            if !name.is_empty() {
+                let path = self
+                    .skills
+                    .iter()
+                    .find(|s| s.name == name)
+                    .map(|s| s.path.display().to_string());
+                let args = if rest.is_empty() {
+                    "sin argumentos adicionales".to_string()
+                } else {
+                    format!("argumentos del usuario: {rest}")
+                };
+                prompt = match path {
+                    Some(p) => format!(
+                        "Usa la skill '{name}' — lee {p} y sigue sus instrucciones ({args})."
+                    ),
+                    None => format!(
+                        "Usa la skill '{name}' de ZCode con el tool Skill y sigue sus instrucciones ({args})."
+                    ),
+                };
+            }
         }
         self.flush_anim(); // la animación nunca bloquea un nuevo prompt
         self.clear_input();

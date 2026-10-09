@@ -12,6 +12,7 @@ mod agent;
 mod app;
 mod frame_projector;
 mod markdown;
+mod modal;
 mod stdio_agent;
 mod theme;
 mod ui;
@@ -48,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
         connect_auto(&workspace, flag("--zcode-bin").as_deref(), flag("--model")).await?
     };
 
-    let mut app = App::new(connector);
+    let mut app = App::new(connector, workspace.clone());
     let r = app.run(frame_rx).await;
     eprintln!(
         "[diag] deltas vivos(session/event)={} frames={}",

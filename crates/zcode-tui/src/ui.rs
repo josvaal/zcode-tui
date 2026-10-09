@@ -45,6 +45,74 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_input(f, app, theme, input);
     draw_status(f, app, theme, status);
     draw_model_picker(f, app, theme, area);
+    draw_modal(f, app, theme, area);
+}
+
+/// Modal genérico con búsqueda difusa (comandos `/`, archivos `@`, skills `$`).
+fn draw_modal(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
+    use ratatui::widgets::Clear;
+    let Some(modal) = &app.modal else { return };
+
+    let (title, query, sel) = match modal {
+        crate::app::Modal::Commands { sel, query } => {
+            (" comandos — enter: ejecutar · esc: cerrar ", query, *sel)
+        }
+        crate::app::Modal::Files { sel, query } => {
+            (" archivos — enter: insertar ruta · esc: cerrar ", query, *sel)
+        }
+        crate::app::Modal::Skills { sel, query } => {
+            (" skills — enter: insertar en el prompt · esc: cerrar ", query, *sel)
+        }
+    };
+
+    let filtered = app.modal_filtered();
+    let items = app.modal_items();
+
+    let width = (area.width.saturating_sub(8)).min(76).max(34);
+    let height = (filtered.len() as u16 + 5).min(area.height.saturating_sub(4)).max(6);
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)).max(1) / 2;
+    let popup = Rect { x, y, width, height };
+
+    let inner_h = height.saturating_sub(4) as usize;
+    let mut visible: Vec<Line> = filtered
+        .iter()
+        .enumerate()
+        .map(|(vis_i, &idx)| {
+            let style = if vis_i == sel {
+                Style::new().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(theme.fg)
+            };
+            Line::from(Span::styled(format!(" {}", items[idx]), style))
+        })
+        .collect();
+    let skip = sel.saturating_sub(inner_h.saturating_sub(1));
+    visible = visible.into_iter().skip(skip).take(inner_h).collect();
+
+    f.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled("› ", Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(query.clone(), Style::new().fg(theme.fg)),
+        Span::styled("▏", Style::new().fg(theme.accent)),
+    ])];
+    if visible.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  sin resultados",
+            Style::new().fg(theme.muted),
+        )));
+    } else {
+        lines.extend(visible);
+    }
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::new().fg(theme.border_active))
+            .title(Span::styled(title, Style::new().fg(theme.accent))),
+    );
+    f.render_widget(para, popup);
 }
 
 fn draw_sidebar(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
@@ -190,6 +258,7 @@ fn welcome_lines(theme: Theme) -> Vec<Line<'static>> {
         String::new(),
         center("enter: enviar · ctrl+p: modelo", W),
         center("ctrl+s: sesiones · ctrl+t: tema", W),
+        center("/: comandos · @: archivos · $: skills", W),
         center("o: ver/ocultar herramientas", W),
     ];
     let mut out = vec![Line::default(), Line::default()];
